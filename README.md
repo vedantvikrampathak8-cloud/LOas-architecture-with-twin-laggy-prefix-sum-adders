@@ -34,6 +34,20 @@ AND gate → twin laggy trees → coalescing buffer → cascade spine → P-LIF
 No pseudo-accumulator. No FIFO-B. No correction logic anywhere.
 
 ---
+Trade-offs vs original LoAS
+All N_TPPE instances run in parallel — every tile computes N_TPPE output neurons simultaneously, not sequentially. So the latency figures below are per tile, not per neuron.
+Per-tile latency
+Original LoAS fast path starts accumulating fiber-B in cycle 1 (fast prefix-sum is combinational). The laggy tree runs in the background and only adds a small correction step at the end. Total critical path is roughly LAGGY_LAT + correction overhead.
+This design has no fast tree. Both trees take LAGGY_LAT cycles before any token enters the spine, and the cascade spine then takes T additional cycles to drain the last token through all T stages.
+Original LoAS   ≈  LAGGY_LAT + ~5 cycles       (e.g. ~133 at T=128)
+This design     ≈  LAGGY_LAT + T  + ~10 cycles  (e.g. ~266 at T=128)
+Per-tile latency is roughly 2× worse in the dense worst case.
+Where this design recovers ground
+SNNs typically have 5–10% firing rates. At that sparsity the zero-bypass gate skips most tokens in 1 cycle each, so the effective throughput on real workloads is much closer than the worst-case numbers suggest. The coalescing buffer also packs sparse tokens before they enter the spine, keeping the pipeline better utilised.
+Area
+No fast prefix-sum tree (which the paper estimates at >45% of inner-join power and area in prior ANN accelerators). No pseudo-accumulator. No FIFO-B, FIFO-mp, or correction accumulator array. The silicon footprint of the inner-join unit is significantly smaller.
+Dynamic power
+Per-stage ICG in the cascade spine means that for every pipeline stage where the assigned bit is 0, the accumulator clock-enable is suppressed and the adder draws zero dynamic toggle power. At 10% SNN firing rate roughly 90% of accumulator stages are gated on any given cycle.
 
 ## Files
 
