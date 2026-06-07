@@ -68,16 +68,6 @@ No pseudo-accumulator. No FIFO-B. No correction logic anywhere.
 ---
 
 ## Running
-
-**iverilog**
-```bash
-iverilog -g2012 -o sim \
-  laggy_prefix_sum.sv inner_join_unit.sv coalescing_bypass_buffer.sv \
-  cascade_spine.sv plif_bank.sv tppe.sv spike_compression_unit.sv \
-  evolved_top.sv tb_evolved_top.sv
-vvp sim
-```
-
 **Vivado** — add all 9 `.sv` files as design sources, set `tb_evolved_top` as simulation top, run Behavioral Simulation. No `` `include `` needed. Once the simulation opens, type the following in the Tcl Console and press Enter — otherwise the simulation stops after the first test and the remaining tests will not run:
 ```
 run all
