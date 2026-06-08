@@ -1,118 +1,105 @@
-# loas-twin-laggy
+# LoAS SNN Accelerator — Twin-Laggy Pipelined RTL
 
-SystemVerilog RTL of a modified LoAS SNN accelerator. The original LoAS paper uses one fast prefix-sum and one laggy prefix-sum in an asymmetric inner-join, which requires a speculative pseudo-accumulator, FIFO-B, FIFO-mp, and correction accumulators to fix wrong predictions. This implementation replaces that entire speculative path with twin symmetric laggy prefix trees, a front-end coalescing buffer, and a deterministic T-stage cascade pipeline — no speculation, no correction overhead.
+Twin-laggy pipelined implementation of the LoAS inner-join accelerator. Both fiber-A and fiber-B bitmasks go through separate laggy prefix-sum units running in parallel. A priority encoder scans the AND result one match per cycle, accumulating directly where spikes actually fire. No speculative accumulation, no correction FIFOs. The 16-cycle laggy latency is hidden inside the previous frame's scan on the warm path.
 
----
+## Architecture
 
-## How the original LoAS inner-join works
+**Cold start:** IDLE → WAIT_COLD (16 cycles, both laggies running) → SCAN (popcount(AND) cycles) → DONE_ST
 
-The paper computes the inner-join between two 128-bit fiber bitmasks (bm-A from the spike matrix, bm-B from the weight matrix) like this:
+**Warm path:** DONE_ST → SCAN directly, zero stall. Laggies for frame N+1 were fired during frame N's scan.
 
-1. AND gate finds matched positions
-2. Fast prefix-sum (1 cycle) immediately generates an offset for fiber-B and accumulates the weight into a pseudo-accumulator, assuming fiber-A fires at all timesteps
-3. Laggy prefix-sum (many cycles) slowly computes the actual fiber-A offsets
-4. When laggy finishes, it checks each buffered position — if fiber-A was NOT all-1s, the wrong contribution is sent to correction accumulators and subtracted at the end
-
-This works but carries hardware cost: FIFO-B, FIFO-mp, pseudo-accumulator, and a full correction accumulator array.
-
----
-
-## What this implementation does differently
-
-Both prefix-sum circuits are now laggy (twin symmetric). Since neither tree is speculative, the pipeline is:
-
-```
-AND gate → twin laggy trees → coalescing buffer → cascade spine → P-LIF
-```
-
-**Coalescing and Early-Bypass Buffer** — sits between the inner-join and the compute spine. If the AND result is all-zero (very common given SNN sparsity), a single OR-reduction gate detects it in 1 cycle and skips the spine entirely. If the token is sparse but non-zero, the buffer holds it and OR-merges it with the next incoming token before firing into the spine.
-
-**Cascade Spine** — a T-stage shift-register pipeline where stage `s` is physically dedicated to temporal slot `s`. When a token arrives at stage `s`, if bit `s` of the token is 1 the accumulator updates; if it is 0 the clock-enable to that accumulator is suppressed and the adder draws zero dynamic power. Tokens advance unconditionally every cycle — zero stall, deterministic T-cycle latency.
-
-**P-LIF** — T parallel LIF comparators that all fire in the same clock cycle, generating output spikes for all timesteps at once.
-
-No pseudo-accumulator. No FIFO-B. No correction logic anywhere.
-
----
- 
-## Trade-offs vs original LoAS
- 
-All N_TPPE instances run in parallel — every tile computes N_TPPE output neurons simultaneously, not sequentially. So the latency figures below are per tile, not per neuron.
- 
-**Per-tile latency**
- 
-Original LoAS fast path starts accumulating fiber-B in cycle 1 (fast prefix-sum is combinational). The laggy tree runs in the background and only adds a small correction step at the end. Total critical path is roughly `LAGGY_LAT + correction overhead`.
- 
-This design has no fast tree. Both trees take `LAGGY_LAT` cycles before any token enters the spine, and the cascade spine then takes `T` additional cycles to drain the last token through all T stages.
- 
-```
-Original LoAS   ≈  LAGGY_LAT + ~5 cycles       (e.g. ~133 at T=128)
-This design     ≈  LAGGY_LAT + T  + ~10 cycles  (e.g. ~266 at T=128)
-```
- 
-Per-tile latency is roughly 2× worse in the dense worst case.
- 
-**Where this design recovers ground**
- 
-SNNs typically have 5–10% firing rates. At that sparsity the zero-bypass gate skips most tokens in 1 cycle each, so the effective throughput on real workloads is much closer than the worst-case numbers suggest. The coalescing buffer also packs sparse tokens before they enter the spine, keeping the pipeline better utilised.
- 
-**Area**
- 
-No fast prefix-sum tree (which the paper estimates at >45% of inner-join power and area in prior ANN accelerators). No pseudo-accumulator. No FIFO-B, FIFO-mp, or correction accumulator array. The silicon footprint of the inner-join unit is significantly smaller.
- 
-**Dynamic power**
- 
-Per-stage ICG in the cascade spine means that for every pipeline stage where the assigned bit is 0, the accumulator clock-enable is suppressed and the adder draws zero dynamic toggle power. At 10% SNN firing rate roughly 90% of accumulator stages are gated on any given cycle.
-## Files
-
-| File | What it does |
-|---|---|
-| `laggy_prefix_sum.sv` | Sequential adder chain, LAGGY_LAT cycles, 1-deep input queue for back-to-back frames |
-| `inner_join_unit.sv` | AND gate + twin laggy trees, latches resolved mask when both trees finish |
-| `coalescing_bypass_buffer.sv` | Zero-bypass OR gate + sparse token coalescing with 2-cycle timeout |
-| `cascade_spine.sv` | T-stage shift pipeline, per-stage ICG clock-enable on accumulator |
-| `plif_bank.sv` | T parallel LIF comparators, signed threshold, one-shot firing |
-| `tppe.sv` | One output neuron: inner_join → coalescing → spine → P-LIF |
-| `spike_compression_unit.sv` | Packs 1-bit spikes into T-bit bitmask words, 2-cycle pipeline |
-| `evolved_top.sv` | Top level: SCU + N_TPPE array + 6-state FSM |
-| `tb_evolved_top.sv` | 6 simulation tests |
-
----
+**Fallback:** If frame N+1's start arrives too late for laggies to finish before frame N's scan ends, DONE_ST falls back to WAIT_COLD and waits for the remaining cycles.
 
 ## Parameters
 
-| Parameter | Default | Notes |
-|---|---|---|
-| T | 128 | Fiber/bitmask width — timesteps per token |
-| K | 4 | K-frames per tile |
-| M / N_TPPE | 8 | Output neurons |
-| W_WIDTH | 8 | Signed weight bit-width |
-| ACC_WIDTH | 32 | Accumulator width |
-| THRESHOLD | 256 | LIF firing threshold |
-| LEAK_SHIFT | 0 | 0 = hard reset; N = v_mem >>> N at frame_start |
-| LAGGY_LAT | 128 | Cycles per laggy tree |
-| DRAIN_CYCLES | 400 | FSM drain budget — must be >= LAGGY_LAT + T + frame_gap + margin |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| T | 4 | Timesteps per inference pass |
+| N_TPPE | 16 | Output neurons in parallel |
+| BM_WIDTH | 128 | Input neuron count (bitmask width) |
+| W_WIDTH | 8 | Weight bit width |
+| ACC_WIDTH | 32 | Accumulator bit width |
+| OFF_W | 7 | ceil(log2(BM_WIDTH)) — prefix offset width |
+| N_ADDERS | 8 | Adder lanes per laggy (latency = BM_WIDTH/N_ADDERS) |
+| THRESHOLD | 1 | LIF firing threshold |
 
----
+## Files
 
-## Running
-**Vivado** — add all 9 `.sv` files as design sources, set `tb_evolved_top` as simulation top, run Behavioral Simulation. No `` `include `` needed. Once the simulation opens, type the following in the Tcl Console and press Enter — otherwise the simulation stops after the first test and the remaining tests will not run:
-```
+| File | Description |
+|------|-------------|
+| `priority_encoder.sv` | Combinational lowest-set-bit finder using in & -in + generate-based one-hot encoder |
+| `laggy_prefix_sum.sv` | Sequential adder-chain prefix sum, BM_WIDTH/N_ADDERS cycle latency, 1-deep input queue |
+| `inner_join_unit.sv` | Twin laggy + PE scan + direct accumulation + pipelined warm path |
+| `p_lif.sv` | Spatially unrolled LIF, T comparators in parallel |
+| `tppe.sv` | Wraps inner_join_unit + p_lif for one output neuron, exposes ready_o |
+| `top_loas.sv` | 16x TPPE array, bm_b broadcast, per-TPPE fiber_a slice |
+| `tb_top_loas.sv` | 5 directed tests including pipeline timing verification |
+
+## Test Cases
+
+| Test | Input | Expected |
+|------|-------|----------|
+| T1 | 128 matches, all spikes 1111, weight=1 | spike=1111 (membrane=128) |
+| T2 | 128 matches, all spikes 0000, weight=1 | spike=0000 (no accumulation) |
+| T3 | Disjoint bitmasks, 0 matches | spike=0000, exits SCAN in 1 cycle |
+| T4 | 8 matches, spike=1010, weight=4 | spike=1010 (membrane[t1,t3]=32) |
+| T5 | Frame 0: 128 matches. Frame 1: 8 matches fired 50 cycles into frame 0's scan | Frame 1 done 10 cycles after frame 0 done (pipeline saves 16 cycles vs 26 without) |
+
+## Simulation — iverilog
+
+## Simulation — Vivado (Tcl console)
+
+Add all source files then run all tests from the Tcl console:
+
+```tcl
+add_files -scan_for_includes {
+    priority_encoder.sv
+    laggy_prefix_sum.sv
+    inner_join_unit.sv
+    p_lif.sv
+    tppe.sv
+    top_loas.sv
+}
+add_files -scan_for_includes -fileset sim_1 tb_top_loas.sv
+set_property top tb_top_loas [get_filesets sim_1]
+set_property top_lib xil_defaultlib [get_filesets sim_1]
+launch_simulation
 run all
 ```
 
-**Expected output**
+Expected output:
+
 ```
-=== T1: dense, weight=6, acc=12 > 10, all fire ===     PASS
-=== T2: dense, weight=4, acc=8  < 10, no fire  ===     PASS
-=== T3: zero bitmask, zero-bypass, no fire      ===     PASS
-=== T4: disjoint bitmasks, AND=0, no fire       ===     PASS
-=== T5: alternating bitmask, even bits fire     ===     PASS
-=== T6: coalescing, lower 32 bits fire          ===     PASS
+T1: dense fire — 128 matches, all spikes 1111
+T1 TPPE[0] spike=1111 (expect 1111)
+...
+T2: dense no-fire — 128 matches, all spikes 0000
+T2 TPPE[0] spike=0000 (expect 0000)
+...
+T3: disjoint bitmasks — 0 matches
+T3 TPPE[0] spike=0000 (expect 0000)
+...
+T4: 8 matches, spike=1010, weight=4
+T4 TPPE[0] spike=1010 (expect 1010)
+...
+T5: pipeline — frame0=128 matches, frame1=8 matches fired mid-scan
+T5 frame0 done at cyc=153
+T5 frame0 TPPE[0] spike=1111 (expect 1111)
+...
+T5 frame1 done at cyc=163 delta=10 (expect ~10, non-pipeline would be ~26)
+T5 frame1 TPPE[0] spike=1010 (expect 1010)
+...
+Done.
 ```
 
----
+## Pipeline Timing
 
-## What is and isn't modelled
+For the warm path (start_i for frame N+1 arrives during frame N's SCAN):
 
-The memory subsystem (global FiberCache, DMA, scheduler, crossbar) is not implemented — bitmasks and weights arrive as direct port inputs. The RTL covers the full compute path from bitmask inputs to output spikes.
+| Scenario | Cycles per frame |
+|----------|-----------------|
+| Cold start | 16 (laggy) + popcount(AND) (scan) + 2 (done + p_lif) |
+| Warm, laggy done before scan ends | popcount(AND) + 2 |
+| Warm, laggy not done | remaining laggy cycles + popcount(AND) + 2 |
+
+The 16-cycle stall is paid only once. After warmup, throughput is limited by popcount(AND) — the actual number of spike matches, not the bitmask width.
